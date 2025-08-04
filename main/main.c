@@ -1,29 +1,34 @@
 #include <string.h>
 
-#include "esp_ota_ops.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "mbedtls/md5.h"
-#include "nvs_flash.h"
+#include <nvs_flash.h>
 
-#include "lwip/err.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
+#include <esp_log.h>
+#include <esp_wifi.h>
+
+#include <mdns.h>
+
+#include "esp_image_format.h"
+#include "esp_ota_ops.h"
+
+#include "otaserver.h"
 
 #define TAG "OTA"
 #define INFO(format, ...)                                                                                             \
     do {                                                                                                              \
-        printf(TAG " I " format "\r\n", ##__VA_ARGS__);                                                               \
+        ESP_LOGI(TAG, format, ##__VA_ARGS__);                                                                         \
     } while (0)
 #define WARN(format, ...)                                                                                             \
     do {                                                                                                              \
-        printf(TAG " W " format "\r\n", ##__VA_ARGS__);                                                               \
+        ESP_LOGW(TAG, format, ##__VA_ARGS__);                                                                         \
     } while (0)
 #define FAIL(format, ...)                                                                                             \
     do {                                                                                                              \
-        printf(TAG " F " format "\r\n", ##__VA_ARGS__);                                                               \
+        ESP_LOGE(TAG, format, ##__VA_ARGS__);                                                                         \
         esp_restart();                                                                                                \
     } while (0)
+
+#define HOSTNAME "meshtastic-ota"
+#define MDNS_INSTANCE "Meshtastic OTA Web server"
 
 typedef struct {
     char ssid[32];
@@ -40,6 +45,7 @@ static void nvs_init(const char *namespace) {
 static void nvs_read_config(wifi_credentials_t *config) {
     size_t ssid_len = sizeof(config->ssid);
     size_t psk_len = sizeof(config->psk);
+
     ESP_ERROR_CHECK(nvs_get_str(s_nvs_handle, "ssid", config->ssid, &ssid_len));
     ESP_ERROR_CHECK(nvs_get_str(s_nvs_handle, "psk", config->psk, &psk_len));
     ESP_ERROR_CHECK(nvs_set_u8(s_nvs_handle, "updated", 0));
@@ -55,29 +61,35 @@ static void nvs_mark_updated() {
 static const int wifi_connect_retries = 10;
 static const EventBits_t BIT_CONNECTED = BIT0;
 static const EventBits_t BIT_FAIL = BIT1;
+
 static EventGroupHandle_t event_group_handle;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     static int s_retry_num = 0;
+
     if (event_base == WIFI_EVENT) {
         if (event_id == WIFI_EVENT_STA_START) {
             INFO("WiFi connect");
             esp_wifi_connect();
+
         } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             if (s_retry_num < wifi_connect_retries) {
                 INFO("WiFi connect retry");
                 esp_wifi_connect();
                 ++s_retry_num;
+
             } else {
                 xEventGroupSetBits(event_group_handle, BIT_FAIL);
             }
         }
+
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
             INFO("WiFi got IP");
             s_retry_num = 0;
             xEventGroupSetBits(event_group_handle, BIT_CONNECTED);
         }
+
     } else {
         FAIL("Unknown event");
     }
@@ -121,278 +133,16 @@ static void wifi_connect(const wifi_credentials_t *config) {
     }
 }
 
-#define OK "OK"
-#define OK_LEN 2
+static void mdns_setup(void) {
+    ESP_ERROR_CHECK(mdns_init());
 
-#define MD5_DIGEST_LENGTH 16
+    mdns_hostname_set(HOSTNAME);
+    mdns_instance_name_set(MDNS_INSTANCE);
 
-typedef enum {
-    ESPOTA_CMD_FLASH = 0,
-    ESPOTA_CMD_SPIFFS = 100,
-    ESPOTA_CMD_AUTH = 200,
-    ESPOTA_CMD_COREDUMP = 300,
-} espota_cmd_t;
+    static mdns_txt_item_t serviceTxtData[] = {{"board", "esp32"}, {"path", "/"}};
 
-typedef struct {
-    in_port_t remote_port;
-    struct sockaddr_in remote_ctrl_addr;
-    size_t firmware_size;
-    uint8_t firmware_md5[MD5_DIGEST_LENGTH];
-    espota_cmd_t cmd;
-} ota_config_t;
-
-static uint8_t buffer[1024];
-
-static bool md5_string_to_bytes(const char *hex, uint8_t *bytes) {
-    for (int i = 0; i < MD5_DIGEST_LENGTH; ++i) {
-        unsigned int byte = 0;
-        if (sscanf(&hex[i * 2], "%02x", &byte) != 1) {
-            return false;
-        }
-        bytes[i] = (uint8_t)byte;
-    }
-    return true;
-}
-
-static size_t md5_bytes_to_string(const uint8_t *bytes, char *hex) {
-    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
-        sprintf(hex + i * 2, "%02x", bytes[i]);
-    }
-    hex[2 * MD5_DIGEST_LENGTH] = '\0';
-    return 2 * MD5_DIGEST_LENGTH;
-}
-
-static void ota_parse_config(const uint8_t *buffer, ota_config_t *config) {
-    int command = 0;
-    unsigned int remote_port = 0;
-    unsigned int firmware_size = 0;
-    char md5[33] = {0};
-    int res = sscanf((const char *)buffer, "%d %u %u %32s", &command, &remote_port, &firmware_size, (char *)&md5);
-    if (res != 4) {
-        FAIL("Invalid header");
-    }
-    espota_cmd_t cmd = (espota_cmd_t)command;
-    switch (cmd) {
-        case ESPOTA_CMD_FLASH:
-        case ESPOTA_CMD_SPIFFS:
-        case ESPOTA_CMD_COREDUMP:
-            config->cmd = cmd;
-            break;
-        default:
-            FAIL("Invalid command");
-    }
-    if (remote_port > UINT16_MAX) {
-        FAIL("Invalid port");
-    }
-    if (firmware_size > 8 * 1024 * 1024) {
-        FAIL("Invalid firmware size");
-    }
-    uint8_t md5_bytes[MD5_DIGEST_LENGTH];
-    if (!md5_string_to_bytes(md5, md5_bytes)) {
-        FAIL("Invalid MD5 string");
-    }
-
-    config->remote_port = htons(remote_port);
-    config->firmware_size = firmware_size;
-    memcpy(config->firmware_md5, md5_bytes, sizeof(md5_bytes));
-}
-
-static int ota_bind_ctrl(int port) {
-    struct sockaddr_in ctrl_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr =
-            {
-                .s_addr = INADDR_ANY,
-            },
-    };
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        FAIL("Failed to create socket");
-    }
-    struct timeval timeout = {0};
-    timeout.tv_sec = 120;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        FAIL("Failed to set timeout");
-    }
-    if (bind(sock, (const struct sockaddr *)&ctrl_addr, sizeof(struct sockaddr_in)) < 0) {
-        FAIL("Failed to bind socket");
-    }
-    return sock;
-}
-
-static int ota_receive_config(int port, ota_config_t *config) {
-    int sock_ctrl = ota_bind_ctrl(port);
-
-    struct sockaddr_in source_addr;
-    socklen_t source_addr_len = sizeof(struct sockaddr_in);
-    ssize_t len = recvfrom(sock_ctrl, buffer, sizeof(buffer), 0, (struct sockaddr *)&source_addr, &source_addr_len);
-    if (len < 0) {
-        FAIL("Failed to receive invitation");
-    }
-
-    ota_parse_config(buffer, config);
-    config->remote_ctrl_addr = source_addr;
-
-    return sock_ctrl;
-}
-
-static int ota_connect_data(ota_config_t *config) {
-    struct sockaddr_in data_addr;
-    data_addr.sin_family = AF_INET;
-    data_addr.sin_addr.s_addr = config->remote_ctrl_addr.sin_addr.s_addr;
-    data_addr.sin_port = config->remote_port;
-
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) {
-        FAIL("Failed to create socket");
-    }
-    int res = connect(sock, (const struct sockaddr *)&data_addr, sizeof(data_addr));
-    if (res != 0) {
-        return -1;
-    }
-    return sock;
-}
-
-static void ota_flash() {
-    INFO("Waiting for invitation");
-    ota_config_t config;
-    int sock_ctrl = ota_receive_config(3232, &config);
-    INFO("Received invitation");
-
-    const esp_partition_t *part_firmware =
-        esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    const esp_partition_t *part_ota =
-        esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
-    const esp_partition_t *part_fs =
-        esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-    const esp_partition_t *part_coredump =
-        esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
-
-    const esp_partition_t *part_target = NULL;
-
-    if (config.cmd == ESPOTA_CMD_FLASH) {
-        if (part_firmware == NULL) {
-            FAIL("Failed to find main firmware parititon");
-        }
-        part_target = part_firmware;
-    } else if (config.cmd == ESPOTA_CMD_SPIFFS) {
-        if (part_fs == NULL) {
-            FAIL("Failed to find filesystem parititon");
-        }
-        part_target = part_fs;
-    } else if (config.cmd == ESPOTA_CMD_COREDUMP) {
-        if (part_fs == NULL) {
-            FAIL("Failed to find coredump parititon");
-        }
-        part_target = part_coredump;
-    } else {
-        FAIL("Internal error: invalid command");
-    }
-
-    INFO("Confirming invitation");
-    ssize_t len = snprintf((char *)buffer, sizeof(buffer), "%s %lu", OK, part_target->size);
-
-    if (sendto(sock_ctrl, buffer, len, 0, (const struct sockaddr *)&config.remote_ctrl_addr,
-               sizeof(struct sockaddr_in)) != len) {
-        FAIL("Failed to send invitation confirmation");
-    }
-    closesocket(sock_ctrl);
-
-    mbedtls_md5_context md5_context;
-    mbedtls_md5_init(&md5_context);
-
-    if (config.cmd == ESPOTA_CMD_FLASH || config.cmd == ESPOTA_CMD_SPIFFS) {
-        INFO("Erasing flash");
-
-        ESP_ERROR_CHECK(esp_ota_set_boot_partition(part_ota));
-        ESP_ERROR_CHECK(esp_partition_erase_range(part_target, 0, part_target->size));
-    }
-
-    int sock = -1;
-    int connect_retries = 5;
-    do {
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-        INFO("Connecting to host");
-        sock = ota_connect_data(&config);
-    } while (--connect_retries && sock < 0);
-
-    if (sock < 0) {
-        FAIL("Failed to connect to host");
-    }
-
-    if (config.cmd == ESPOTA_CMD_FLASH || config.cmd == ESPOTA_CMD_SPIFFS) {
-        INFO("Connected to host, now flashing");
-
-        size_t bytes_received = 0;
-        while (bytes_received < config.firmware_size) {
-            ssize_t len = recv(sock, buffer, sizeof(buffer), 0);
-            if (len < 0) {
-                FAIL("Failed to receive a chunk");
-            }
-            mbedtls_md5_update(&md5_context, buffer, len);
-            ESP_ERROR_CHECK(esp_partition_write(part_target, bytes_received, buffer, len));
-            if (send(sock, OK, OK_LEN, 0) != OK_LEN) {
-                FAIL("Failed to confirm a chunk");
-            }
-            bytes_received += len;
-        }
-
-        INFO("Firmware written");
-
-        unsigned char md5[MD5_DIGEST_LENGTH];
-        mbedtls_md5_finish(&md5_context, md5);
-        if (memcmp(config.firmware_md5, md5, sizeof(md5)) != 0) {
-            FAIL("Checksum mismatch");
-        }
-
-        INFO("Checksum OK");
-        ESP_ERROR_CHECK(esp_ota_set_boot_partition(part_firmware));
-
-        nvs_mark_updated();
-    }
-
-    if (config.cmd == ESPOTA_CMD_COREDUMP) {
-        INFO("Connected to host, now sending");
-
-        size_t bytes_sent = 0;
-        size_t bytes_left = part_target->size;
-        while (bytes_left > 0) {
-            size_t chunk_size = sizeof(buffer);
-            if (chunk_size > bytes_left) {
-                chunk_size = bytes_left;
-            }
-
-            ESP_ERROR_CHECK(esp_partition_read(part_target, bytes_sent, buffer, chunk_size));
-            mbedtls_md5_update(&md5_context, buffer, chunk_size);
-
-            ssize_t len = write(sock, buffer, chunk_size);
-            if (len != chunk_size) {
-                FAIL("Failed to send chunk");
-            }
-            len = recv(sock, buffer, sizeof(buffer), 0);
-            if (len < OK_LEN || (memcmp(buffer, OK, OK_LEN) != 0)) {
-                FAIL("Failed to get a chunk confirmation");
-            }
-            bytes_sent += chunk_size;
-            bytes_left -= chunk_size;
-        }
-
-        INFO("Coredump sent");
-
-        unsigned char md5[MD5_DIGEST_LENGTH];
-        mbedtls_md5_finish(&md5_context, md5);
-
-        len = snprintf((char *)buffer, sizeof(buffer), "%s ", OK);
-        len += md5_bytes_to_string(md5, (char*)&buffer[len]);
-
-        if (send(sock, buffer, len, 0) != len) {
-            FAIL("Failed to send a coredump confirmation");
-        }
-    }
-
-    shutdown(sock, 0);
-    closesocket(sock);
+    ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, serviceTxtData,
+                                         sizeof(serviceTxtData) / sizeof(serviceTxtData[0])));
 }
 
 static const char *get_type_str(esp_partition_type_t type) {
@@ -480,24 +230,34 @@ static const char *get_subtype_str(esp_partition_type_t type, esp_partition_subt
     return "unknown";
 }
 
-static void print_info() {
+static void print_info(void) {
     const esp_app_desc_t *desc = esp_app_get_description();
-    printf("%s %s %s %s %s\r\n", desc->project_name, desc->version, desc->idf_ver, desc->date, desc->time);
+    INFO("%s %s %s %s %s", desc->project_name, desc->version, desc->idf_ver, desc->date, desc->time);
 
     esp_partition_iterator_t part_it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
     while (part_it) {
         const esp_partition_t *part = esp_partition_get(part_it);
         const char *type = get_type_str(part->type);
         const char *subtype = get_subtype_str(part->type, part->subtype);
-        printf("%16s %7s %9s 0x%08" PRIx32 " %10" PRIi32 " %5" PRIu32 " \r\n", part->label, type, subtype,
-               part->address, part->size, part->erase_size);
+
+        INFO("%16s %7s %9s 0x%08" PRIx32 " %10" PRIi32 " %5" PRIu32, part->label, type, subtype,
+                 part->address, part->size, part->erase_size);
         part_it = esp_partition_next(part_it);
+    }
+}
+
+static void otaserver_event_cb(uint8_t event) {
+    switch (event) {
+        case OTA_EVENT_SUCCESS:
+            nvs_mark_updated();
+            break;
     }
 }
 
 void app_main() {
     print_info();
     nvs_init("ota-wifi");
+
     wifi_credentials_t config;
     INFO("Reading NVRAM storage");
     nvs_read_config(&config);
@@ -505,6 +265,9 @@ void app_main() {
     INFO("Connecting to WiFi AP \"%s\"", config.ssid);
     wifi_connect(&config);
 
-    ota_flash();
-    esp_restart();
+    INFO("Setting hostname and mDNS");
+    mdns_setup();
+
+    INFO("Starting web server");
+    ESP_ERROR_CHECK(otaserver_start(&otaserver_event_cb));
 }
