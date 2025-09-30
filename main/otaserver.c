@@ -40,6 +40,7 @@ const char index_html[] =
     "  <input type=\"file\" id=\"firmware\" accept=\".bin\"><br><br>"
     "  <button onclick=\"uploadFirmware()\">Upload firmware</button>"
     "  <button onclick=\"downloadCoredump()\">Download coredump</button>"
+    "  <button onclick=\"rebootToApp()\">Reboot to app</button>"
     "  <hr>"
     "  <pre id=\"status\"></pre>"
     "  <script>"
@@ -76,6 +77,17 @@ const char index_html[] =
     "        a.download = 'coredump.bin';"
     "        a.click();"
     "        URL.revokeObjectURL(url);"
+    "      } catch (err) {"
+    "        status.textContent = 'Error: ' + err;"
+    "      }"
+    "    }"
+    "    async function rebootToApp() {"
+    "      const status = document.getElementById('status');"
+    "      try {"
+    "        const res = await fetch('/reboot', {"
+    "          method: 'POST'"
+    "        });"
+    "        status.textContent = res.ok ? 'Reboot successful.' : 'Reboot failed: ' + res.statusText;"
     "      } catch (err) {"
     "        status.textContent = 'Error: ' + err;"
     "      }"
@@ -304,11 +316,36 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-esp_err_t restart_post_handler(httpd_req_t *req) {
+esp_err_t reboot_post_handler(httpd_req_t *req) {
+    esp_err_t err;
+    const esp_partition_t *update_partition = NULL;
+
     PM_LOCK_ACQUIRE();
+
+    update_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    assert(update_partition != NULL);
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
+
+        httpd_resp_set_status(req, HTTPD_500);
+        httpd_resp_send(req, NULL, 0);
+
+        if (otaserver_event_cb != NULL) {
+            (*otaserver_event_cb)(OTA_EVENT_FAILED);
+        }
+
+        PM_LOCK_RELEASE();
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_status(req, HTTPD_202);
     httpd_resp_send(req, NULL, 0);
+
+    if (otaserver_event_cb != NULL) {
+        (*otaserver_event_cb)(OTA_EVENT_REBOOT);
+    }
 
     ESP_LOGI(TAG, "prepare to system restart");
     xTaskCreate(esp_restart_task, "esp_restart_task", 1024, NULL, 5, NULL);
@@ -426,14 +463,14 @@ static const httpd_uri_t index_htm_uri = {
 
 static const httpd_uri_t ota_uri = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler, .user_ctx = NULL};
 
-static const httpd_uri_t restart_uri = {
-    .uri = "/restart", .method = HTTP_POST, .handler = restart_post_handler, .user_ctx = NULL};
+static const httpd_uri_t reboot_uri = {
+    .uri = "/reboot", .method = HTTP_POST, .handler = reboot_post_handler, .user_ctx = NULL};
 
 static const httpd_uri_t coredump_uri = {
     .uri = "/coredump", .method = HTTP_GET, .handler = coredump_get_handler, .user_ctx = NULL};
 
 static const httpd_uri_t *uri_handlers[] = {&root_uri, &index_html_uri, &index_htm_uri,
-                                            &ota_uri,  &restart_uri,    &coredump_uri};
+                                            &ota_uri,  &reboot_uri,     &coredump_uri};
 
 void esp_restart_task(void *pvParameter) {
     vTaskDelay(OTA_RESTART_DELAY_TICKS);

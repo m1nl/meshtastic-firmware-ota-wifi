@@ -14,7 +14,8 @@ extern "C" {
 #define OTA_EVENT_IDLE 0
 #define OTA_EVENT_BEGIN 1
 #define OTA_EVENT_SUCCESS 2
-#define OTA_EVENT_FAILED 3
+#define OTA_EVENT_REBOOT 3
+#define OTA_EVENT_FAILED 4
 
 #define HTTPD_202 "202 Accepted" /*!< HTTP Response 202 */
 
