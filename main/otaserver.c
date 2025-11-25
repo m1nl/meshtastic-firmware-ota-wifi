@@ -113,29 +113,26 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
         (*otaserver_event_cb)(OTA_EVENT_BEGIN);
     }
 
-    esp_ota_handle_t update_handle = 0;
-    const esp_partition_t *update_partition = NULL;
+    esp_ota_handle_t app_handle = 0;
+    const esp_partition_t *app_partition = NULL;
 
     ESP_LOGI(TAG, "starting OTA handler");
 
-    const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
-
-    if (configured != running) {
-        ESP_LOGW(TAG,
-                 "configured OTA boot partition at offset 0x%08" PRIx32 ", but running "
-                 "from offset 0x%08" PRIx32,
-                 configured->address, running->address);
-        ESP_LOGW(TAG, "(this can happen if either the OTA boot data or preferred "
-                      "boot image become corrupted somehow.)");
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "marking current running partition subtype %d at offset 0x%08" PRIx32 " as valid",
+                     running->subtype, running->address);
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
     }
-    ESP_LOGI(TAG, "running partition type %d subtype %d (offset 0x%08" PRIx32 ")", running->type, running->subtype,
-             running->address);
 
-    update_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    ESP_LOGI(TAG, "writing to partition subtype %d at offset 0x%08" PRIx32, update_partition->subtype,
-             update_partition->address);
-    assert(update_partition != NULL);
+    app_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    ESP_LOGI(TAG, "writing to partition subtype %d at offset 0x%08" PRIx32, app_partition->subtype,
+             app_partition->address);
+
+    assert(app_partition != NULL);
 
     image_header_was_checked = false;
     binary_file_length = 0;
@@ -155,7 +152,7 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
 
             ESP_LOGE(TAG, "data read error");
             if (image_header_was_checked) {
-                esp_ota_abort(update_handle);
+                esp_ota_abort(app_handle);
             }
 
             httpd_resp_set_status(req, HTTPD_400);
@@ -182,12 +179,12 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
 
                     ESP_LOGI(TAG, "new firmware version: %s", new_app_info.version);
 
-                    esp_app_desc_t running_app_info;
-                    if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
-                        ESP_LOGI(TAG, "running firmware version: %s", running_app_info.version);
+                    esp_app_desc_t app_info;
+                    if (esp_ota_get_partition_description(app_partition, &app_info) == ESP_OK) {
+                        ESP_LOGI(TAG, "current firmware version: %s", app_info.version);
                     }
 
-                    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+                    err = esp_ota_begin(app_partition, OTA_WITH_SEQUENTIAL_WRITES, &app_handle);
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
 
@@ -208,7 +205,7 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
 
                 } else {
                     ESP_LOGE(TAG, "received package does not fit header length");
-                    esp_ota_abort(update_handle);
+                    esp_ota_abort(app_handle);
 
                     httpd_resp_set_status(req, HTTPD_400);
                     httpd_resp_send(req, NULL, 0);
@@ -222,10 +219,10 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
                 }
             }
 
-            err = esp_ota_write(update_handle, (const void *)ota_write_data, data_read);
+            err = esp_ota_write(app_handle, (const void *)ota_write_data, data_read);
 
             if (err != ESP_OK) {
-                esp_ota_abort(update_handle);
+                esp_ota_abort(app_handle);
 
                 httpd_resp_set_status(req, HTTPD_500);
                 httpd_resp_send(req, NULL, 0);
@@ -244,7 +241,7 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
         } else if (data_read == 0) {
             ESP_LOGE(TAG, "connection closed");
             if (image_header_was_checked) {
-                esp_ota_abort(update_handle);
+                esp_ota_abort(app_handle);
             }
 
             httpd_resp_set_status(req, HTTPD_400);
@@ -264,7 +261,7 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
         (*otaserver_event_cb)(OTA_EVENT_IDLE);
     }
 
-    err = esp_ota_end(update_handle);
+    err = esp_ota_end(app_handle);
     if (err != ESP_OK) {
         if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
             ESP_LOGE(TAG, "image validation failed, image is corrupted");
@@ -286,7 +283,7 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
         (*otaserver_event_cb)(OTA_EVENT_IDLE);
     }
 
-    err = esp_ota_set_boot_partition(update_partition);
+    err = esp_ota_set_boot_partition(app_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
 
@@ -318,14 +315,14 @@ esp_err_t ota_post_handler(httpd_req_t *req) {
 
 esp_err_t reboot_post_handler(httpd_req_t *req) {
     esp_err_t err;
-    const esp_partition_t *update_partition = NULL;
+    const esp_partition_t *app_partition = NULL;
 
     PM_LOCK_ACQUIRE();
 
-    update_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    assert(update_partition != NULL);
+    app_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    assert(app_partition != NULL);
 
-    err = esp_ota_set_boot_partition(update_partition);
+    err = esp_ota_set_boot_partition(app_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
 
