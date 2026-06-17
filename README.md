@@ -5,7 +5,7 @@
 
 ### Usage
 
-Build the firmware using ESP-IDF 5.4.x
+Build the firmware using ESP-IDF 5.5.x
 ```
 source ~/dev/esp-idf/export.sh
 idf.py build
@@ -17,6 +17,12 @@ and write OTA binary to the 2nd OTA partition (take its address from partition t
 esptool.py --port <...> write_flash 0x340000 build/OTA-WiFi.bin
 ```
 After rebooting the device into OTA firmware (the main firmware has to have some way of doing that), open IP address in the browser and use upload form to flash firmware.
+
+Given the changes in `meshtastic-cli`, one has to now use the following command to make the node boot into OTA mode:
+```
+meshtastic --host <IP / host> --ota-update <whatever_file_does_not_matter>
+```
+The above command will try to send the update over TCP, but simply stop it and you should be able to open a web page allowing you to upload your firmware file.
 
 ### Details
 
