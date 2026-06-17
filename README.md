@@ -18,6 +18,11 @@ esptool.py --port <...> write_flash 0x340000 build/OTA-WiFi.bin
 ```
 After rebooting the device into OTA firmware (the main firmware has to have some way of doing that), open IP address in the browser and use upload form to flash firmware.
 
+Example for Heltec V4 (which used `default_16MB.csv` partition table):
+```
+esptool.py --chip esp32s3  write_flash 0x650000 MeshtasticOTA-WiFi-esp32s3.bin
+```
+
 Given the changes in `meshtastic-cli`, one has to now use the following command to make the node boot into OTA mode:
 ```
 meshtastic --host <IP / host> --ota-update <whatever_file_does_not_matter>
