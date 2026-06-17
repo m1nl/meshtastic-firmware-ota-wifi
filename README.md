@@ -27,7 +27,7 @@ Given the changes in `meshtastic-cli`, one has to now use the following command 
 ```
 meshtastic --host <IP / host> --ota-update <whatever_file_does_not_matter>
 ```
-The above command will try to send the update over TCP, but simply stop it and you should be able to open a web page allowing you to upload your firmware file.
+The above command will try to send the update over TCP, but simply stop it after the node reboots and you should be able to open a web page allowing you to upload your firmware file.
 
 ### Details
 
