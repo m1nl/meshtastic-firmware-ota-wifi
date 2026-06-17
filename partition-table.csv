@@ -1,6 +1,9 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x009000, 0x005000,
-otadata,  data, ota,     0x00e000, 0x002000,
-app,      app,  ota_0,   0x010000, 0x250000,
-flashApp, app,  ota_1,   0x260000, 0x0A0000,
-spiffs,   data, spiffs,  0x300000, 0x100000,
+# Name,   Type, SubType, Offset,   Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+nvs,         data, nvs,     0x009000,0x004000,
+otadata,     data, ota,     0x00d000,0x002000,
+phy_init,    data, phy,     0x00f000,0x001000,
+app,         app,  ota_0,   0x010000,0x0a0000,
+flashApp,    app,  ota_1,   0x0b0000,0x0a0000,
+spiffs,      data, spiffs,  0x150000,0x0a0000,
+coredump,    data, coredump,0x1f0000,0x010000,

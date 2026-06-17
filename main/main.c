@@ -256,7 +256,7 @@ static void otaserver_event_cb(uint8_t event) {
 
 void app_main() {
     print_info();
-    nvs_init("ota-wifi");
+    nvs_init("MeshtasticOTA");
 
     wifi_credentials_t config;
     INFO("Reading NVRAM storage");
